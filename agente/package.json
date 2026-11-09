@@ -4,7 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Agente A2A que consome o servidor MCP de salas como host MCP",
-  "scripts": { "start": "node src/server.js" },
-  "engines": { "node": ">=20" },
-  "dependencies": {}
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.4.0"
+  }
 }

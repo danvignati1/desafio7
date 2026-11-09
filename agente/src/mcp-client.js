@@ -1,80 +1,122 @@
-// Cliente MCP mínimo sobre fetch, escrito à mão de propósito.
+// Cliente MCP do agente, sobre o SDK oficial `@modelcontextprotocol/client` (revisão 2026-07-28).
 //
-// O agente precisa enxergar o `input_required` CRU: um cliente de SDK com callback de
-// elicitation responderia a pergunta sozinho e a Task A2A nunca pausaria. Aqui o cliente só
-// monta o envelope por request (sem sessão), manda e devolve o resultado como veio.
+// O ponto de atenção é o MRTR: com o padrão do SDK (`autoFulfill: true`) o cliente responderia
+// a elicitation sozinho, por callback, e o ciclo fecharia sem voltar ao cliente A2A: a Task
+// nunca pausaria. Por isso o cliente roda em MODO MANUAL: `autoFulfill: false` no cliente e
+// `allowInputRequired: true` na chamada, e o `input_required` chega CRU ao agente.
+//
+// `callTool()` não serve nesse caminho (ele exige `structuredContent` e rejeita o
+// `input_required`), então o tools/call vai por `client.request()` com `withInputRequired()`,
+// que é o caminho documentado pelo SDK para o modo manual.
 import { randomBytes } from "node:crypto";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  specTypeSchemas,
+  withInputRequired,
+} from "@modelcontextprotocol/client";
 
 export const PROTOCOLO = "2026-07-28";
-export const CAPABILITIES = { elicitation: { form: {} } };
-const CLIENT_INFO = { name: "agente-central-de-salas", version: "1.0.0" };
-
-// Ids de JSON-RPC únicos por request: o retry de uma pausa NUNCA reaproveita o id anterior.
-let contador = 0;
-const novoId = () => `agente-${++contador}-${randomBytes(4).toString("hex")}`;
+const CALL_TOOL_RESULT = withInputRequired(specTypeSchemas.CallToolResult);
 
 export class ErroMcp extends Error {
-  constructor(erro, http) {
+  constructor(erro) {
     super(erro?.message ?? "erro MCP");
     this.codigo = erro?.code;
     this.dados = erro?.data;
-    this.http = http;
   }
+}
+
+/** Erros do SDK (JSON-RPC ou HTTP) viram ErroMcp, sem nunca carregar o requestState. */
+function traduzir(e) {
+  if (typeof e?.code === "number") return new ErroMcp({ code: e.code, message: e.message, data: e.data });
+  try {
+    const corpo = JSON.parse(e?.data?.text ?? "");
+    if (corpo?.error) return new ErroMcp(corpo.error);
+  } catch {
+    /* corpo não era JSON-RPC */
+  }
+  return e;
 }
 
 export class ClienteMcp {
   constructor(url) {
     this.url = url;
+    this.conectando = undefined;
+    this.client = undefined;
   }
 
   /**
-   * Um request MCP. Declara, em TODO request: versão, clientInfo, a capability de elicitation
-   * em form mode e, quando houver, o traceparent (mesmo trace-id, span-id novo). Os headers
-   * espelham o corpo (MCP-Protocol-Version, Mcp-Method e Mcp-Name).
-   * Devolve { id, result }. Erro de protocolo vira ErroMcp.
+   * Um único objeto cliente vivo entre chamadas (é só o objeto, sem estado de protocolo):
+   * cada request leva o próprio envelope `_meta` com versão e capabilities, e a versão é
+   * fixada na revisão 2026-07-28. A capability declarada é a elicitation em form mode.
    */
-  async chamar(metodo, params, { nome, traceId } = {}) {
-    const meta = {
-      "io.modelcontextprotocol/protocolVersion": PROTOCOLO,
-      "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
-      "io.modelcontextprotocol/clientCapabilities": CAPABILITIES,
-    };
-    if (traceId) meta.traceparent = `00-${traceId}-${randomBytes(8).toString("hex")}-01`;
-
-    const id = novoId();
-    const headers = {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      "MCP-Protocol-Version": PROTOCOLO,
-      "Mcp-Method": metodo,
-    };
-    if (nome) headers["Mcp-Name"] = nome;
-
-    const resp = await fetch(this.url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ jsonrpc: "2.0", id, method: metodo, params: { ...params, _meta: meta } }),
+  async conectar() {
+    this.conectando ??= (async () => {
+      const client = new Client(
+        { name: "agente-central-de-salas", version: "1.0.0" },
+        {
+          capabilities: { elicitation: { form: {} } },
+          inputRequired: { autoFulfill: false },
+          versionNegotiation: { mode: { pin: PROTOCOLO } },
+        },
+      );
+      await client.connect(new StreamableHTTPClientTransport(new URL(this.url)));
+      this.client = client;
+    })().catch((e) => {
+      this.conectando = undefined; // permite tentar de novo no próximo request
+      throw e;
     });
-    const corpo = await resp.json().catch(() => ({}));
-    if (corpo.error) throw new ErroMcp(corpo.error, resp.status);
-    if (!corpo.result) throw new ErroMcp({ message: `resposta MCP inesperada (HTTP ${resp.status})` }, resp.status);
-    return { id, result: corpo.result };
+    await this.conectando;
+    return this.client;
+  }
+
+  /** traceparent com o MESMO trace-id da Task e span-id novo a cada request. */
+  static meta(traceId) {
+    return traceId ? { traceparent: `00-${traceId}-${randomBytes(8).toString("hex")}-01` } : undefined;
   }
 
   /** tools/list: as tools são descobertas em runtime, nunca hardcoded. */
-  async listarTools(opcoes) {
-    const { result } = await this.chamar("tools/list", {}, opcoes);
-    return result.tools ?? [];
+  async listarTools({ traceId } = {}) {
+    try {
+      const client = await this.conectar();
+      const { tools } = await client.listTools({ _meta: ClienteMcp.meta(traceId) });
+      return tools ?? [];
+    } catch (e) {
+      throw traduzir(e);
+    }
   }
 
-  /** resources/read de um recurso; devolve o texto do primeiro conteúdo. */
-  async lerRecurso(uri, opcoes) {
-    const { result } = await this.chamar("resources/read", { uri }, { ...opcoes, nome: uri });
-    return result.contents?.[0]?.text ?? "";
+  /** resources/read; devolve o texto do primeiro conteúdo. */
+  async lerRecurso(uri, { traceId } = {}) {
+    try {
+      const client = await this.conectar();
+      const r = await client.readResource({ uri, _meta: ClienteMcp.meta(traceId) });
+      return r.contents?.[0]?.text ?? "";
+    } catch (e) {
+      throw traduzir(e);
+    }
   }
 
-  /** tools/call. `extra` leva inputResponses e requestState no retry de um MRTR. */
-  chamarTool(nome, argumentos, extra = {}, opcoes) {
-    return this.chamar("tools/call", { name: nome, arguments: argumentos, ...extra }, { ...opcoes, nome });
+  /**
+   * tools/call em modo manual. `extra` leva `inputResponses` e `requestState` no retry de um
+   * MRTR; cada chamada é um request novo do SDK, com id de JSON-RPC novo.
+   * Devolve { result }: o resultado completo, ou o `input_required` cru.
+   */
+  async chamarTool(nome, argumentos, extra = {}, { traceId } = {}) {
+    try {
+      const client = await this.conectar();
+      const result = await client.request(
+        {
+          method: "tools/call",
+          params: { name: nome, arguments: argumentos, ...extra, _meta: ClienteMcp.meta(traceId) },
+        },
+        CALL_TOOL_RESULT,
+        { allowInputRequired: true },
+      );
+      return { result };
+    } catch (e) {
+      throw traduzir(e);
+    }
   }
 }
