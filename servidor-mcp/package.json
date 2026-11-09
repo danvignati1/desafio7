@@ -13,6 +13,7 @@
   "type": "module",
   "private": true,
   "dependencies": {
+    "@modelcontextprotocol/node": "2.1.2",
     "@modelcontextprotocol/server": "2.4.0",
     "zod": "4.6.7"
   },

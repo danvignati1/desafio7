@@ -64,7 +64,7 @@ Tudo está em [`agente/src/ponte.js`](agente/src/ponte.js). O ponto em que o `in
 - **Reservas.** Em memória no servidor MCP, carregadas de `dados/reservas.json` ao subir.
 - **`traceparent`.** O agente extrai o trace-id do header `traceparent` do cliente A2A e o repete, com span-id novo, no `_meta` de todos os requests MCP daquela Task (`tools/list`, `resources/read` e `tools/call`, inclusive o retry). O servidor registra cada request no stderr: `[mcp] metodo=... id=... traceparent=...`.
 - **Cliente MCP do agente em modo manual.** O agente usa o SDK oficial `@modelcontextprotocol/client` com `inputRequired: { autoFulfill: false }` e `allowInputRequired: true` na chamada. Com o padrão do SDK (`autoFulfill: true`) o cliente responderia a elicitation por callback e o ciclo fecharia sem voltar ao cliente A2A, e a Task nunca pausaria. O `callTool()` não serve nesse caminho, porque exige `structuredContent` e rejeita o `input_required`; o `tools/call` vai por `client.request()` com `withInputRequired()`, o caminho documentado pelo SDK para o modo manual ([`agente/src/mcp-client.js`](agente/src/mcp-client.js)). A versão é fixada em `2026-07-28` (`versionNegotiation: { mode: { pin } }`): sem isso o cliente começaria com o `initialize` da era 2025 e o servidor, só modern, o recusaria. O SDK envia o envelope `_meta` e os headers `MCP-Protocol-Version`, `Mcp-Method` e `Mcp-Name` em todo request. O agente só acrescenta o `traceparent` (mesmo trace-id, span-id novo). Nenhuma limitação do SDK impediu algum item do enunciado.
-- **Adaptador HTTP próprio no servidor.** O pacote `@modelcontextprotocol/node` não tem versão `2.4.0` publicada no npm, então `createMcpHandler(...).fetch` é ligado ao `node:http` em poucas linhas, que também registram o log do stderr.
+- **Adaptador HTTP oficial.** O `createMcpHandler(...)` é ligado ao `node:http` pelo `toNodeHandler` de `@modelcontextprotocol/node` 2.1.2, a versão mais recente do pacote (não existe 2.4.0 dele; ele declara o peer `@modelcontextprotocol/server ^2.4.0`, que o servidor satisfaz). O log do stderr entra por um clone do request, então o corpo segue intacto para o handler.
 - **Descoberta em runtime.** A cada Task o agente chama `tools/list` antes do primeiro `tools/call`, confere que `reservar_sala` existe e lê o resource `politica://uso` para extrair a versão da política (primeira linha), que vai para o artifact `reserva`.
 - **Ordem das validações de erro.** Sala, intervalo invertido, janela de uso, duração. A janela é avaliada no relógio de São Paulo (-03:00).
 
@@ -73,7 +73,7 @@ Tudo está em [`agente/src/ponte.js`](agente/src/ponte.js). O ponto em que o `in
 Última execução, com os dois processos recém-iniciados:
 
 ```
-trace-id desta execucao: 15b506b93c4fe31814f8696d6a84d510
+trace-id desta execucao: 7bc90895764096add7484a82efd92681
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools

@@ -6,6 +6,7 @@
 // preciso para reconstruir o pedido. O cliente volta com um request novo, e é o
 // `requestState` (verificado) que manda, nunca os argumentos reenviados.
 import { createServer } from "node:http";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 import {
   McpServer,
   createMcpHandler,
@@ -233,6 +234,7 @@ const handler = createMcpHandler(() => criarMcpServer(), {
   onerror: (e) => console.error(`[mcp] erro: ${e?.message ?? e}`),
 });
 
+/** Log de cada request no stderr: método, id e traceparent (quando vier no `_meta`). */
 function registrar(corpo) {
   const msgs = Array.isArray(corpo) ? corpo : [corpo];
   for (const m of msgs) {
@@ -244,44 +246,29 @@ function registrar(corpo) {
   }
 }
 
-const http = createServer(async (req, res) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  if (url.pathname !== CAMINHO) {
+// O adaptador oficial liga o `fetch` do handler ao node:http. O log entra por um clone do
+// request, então o corpo continua intacto para o handler.
+const comLog = {
+  fetch: async (request, opcoes) => {
+    if (request.method === "POST") {
+      try {
+        registrar(await request.clone().json());
+      } catch {
+        console.error("[mcp] corpo nao e JSON valido");
+      }
+    }
+    return handler.fetch(request, opcoes);
+  },
+};
+const noNode = toNodeHandler(comLog, { onerror: (e) => console.error(`[mcp] falha inesperada: ${e?.stack ?? e}`) });
+
+const http = createServer((req, res) => {
+  const { pathname } = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  if (pathname !== CAMINHO) {
     res.writeHead(404).end();
     return;
   }
-  const partes = [];
-  for await (const p of req) partes.push(p);
-  const corpo = Buffer.concat(partes);
-
-  let parsed;
-  if (req.method === "POST") {
-    try {
-      parsed = JSON.parse(corpo.toString("utf8"));
-      registrar(parsed);
-    } catch {
-      console.error("[mcp] corpo nao e JSON valido");
-    }
-  }
-
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (v !== undefined) headers.set(k, Array.isArray(v) ? v.join(", ") : v);
-  }
-  const request = new Request(url, {
-    method: req.method,
-    headers,
-    body: req.method === "GET" || req.method === "HEAD" ? undefined : corpo,
-  });
-
-  try {
-    const resposta = await handler.fetch(request, parsed === undefined ? undefined : { parsedBody: parsed });
-    res.writeHead(resposta.status, Object.fromEntries(resposta.headers));
-    res.end(Buffer.from(await resposta.arrayBuffer()));
-  } catch (e) {
-    console.error(`[mcp] falha inesperada: ${e?.stack ?? e}`);
-    res.writeHead(500).end();
-  }
+  noNode(req, res);
 });
 
 http.listen(PORTA, () => {
